@@ -29,14 +29,15 @@ async fn begin_operation_transaction(
     Ok(sqlx::Transaction::begin(connection, None).await?)
 }
 
-/// Namespace for the per-community push-gate advisory lock. Must match the
-/// key built inside the `enqueue_push_match_job` trigger (migration 0023):
-/// event inserts take it SHARED there; every lease transition that can make
-/// match eligibility true takes it EXCLUSIVE here, forcing a total order so
-/// a concurrent event insert either sees the committed lease or strictly
-/// precedes the activation (in which case no wake was owed). Distinct key
-/// domain from the audit lock and the lease address/author locks.
-const PUSH_GATE_LOCK_NAMESPACE: &str = "buzz_push_gate:";
+/// Namespace for the per-community push-gate advisory lock. Event inserts
+/// take it SHARED in `event_follow_up::enqueue_push_match` (and in the
+/// `enqueue_push_match_job` trigger from migration 0023 until it is retired);
+/// every lease transition that can make match eligibility true takes it
+/// EXCLUSIVE here, forcing a total order so a concurrent event insert either
+/// sees the committed lease or strictly precedes the activation (in which case
+/// no wake was owed). Distinct key domain from the audit lock and the lease
+/// address/author locks.
+pub(crate) const PUSH_GATE_LOCK_NAMESPACE: &str = "buzz_push_gate:";
 
 async fn acquire_push_gate_lock(tx: &mut sqlx::PgConnection, community: CommunityId) -> Result<()> {
     crate::observability::observe_advisory_lock(
@@ -59,10 +60,10 @@ const PUSH_GATE_BACKFILL_SECS: i64 = 120;
 /// Enqueue match jobs for recent gate-skipped events. MUST run inside the same
 /// transaction that holds the exclusive push-gate lock: after this commit,
 /// every event is either backfilled here or ordered after the activation and
-/// enqueued by the trigger — running it post-commit would reopen the gap.
+/// enqueued by the event producer — running it post-commit would reopen the gap.
 /// Keyed on relay `received_at` (not author-controlled `created_at`); the kind
-/// list mirrors the trigger allowlist; `ON CONFLICT DO NOTHING` dedups against
-/// rows the trigger already enqueued.
+/// list mirrors `event_follow_up::PUSH_MATCH_KINDS`; `ON CONFLICT DO NOTHING`
+/// dedups against rows the event producer already enqueued.
 async fn backfill_push_match_jobs(
     tx: &mut sqlx::PgConnection,
     community: CommunityId,
@@ -280,7 +281,8 @@ pub async fn accept_lease_event(
     )
     .await?;
     // T1b: an activation can flip the community from "no eligible lease" to
-    // "eligible", so it must serialize against the trigger's shared gate lock.
+    // "eligible", so it must serialize against the event producer's shared
+    // gate lock.
     // Acquired after the address/author locks to keep one global lock order.
     if active.is_some() {
         acquire_push_gate_lock(&mut tx, community).await?;
@@ -395,6 +397,14 @@ pub async fn accept_lease_event(
         }
         return Err(error.into());
     }
+    // The row above is always kind 30350 with no channel.
+    crate::store::event_follow_up::after_admitted_insert(
+        &mut tx,
+        event.id.as_bytes().as_slice(),
+        30350,
+        None,
+    )
+    .await?;
 
     let (is_active, app_profile, endpoint_hash, endpoint_grant, max_class, subscriptions) = active
         .map_or((false, None, None, None, None, None), |active| {
@@ -512,8 +522,8 @@ async fn replace_lease(
         };
 
     // T1b: an activating replacement can flip the community from "no eligible
-    // lease" to "eligible"; serialize it against the trigger's shared gate
-    // lock (gate → lease row, matching accept_lease_event's global order).
+    // lease" to "eligible"; serialize it against the event producer's shared
+    // gate lock (gate → lease row, matching accept_lease_event's global order).
     // Revocations (is_active = false) never make eligibility true and skip it.
     let mut tx =
         begin_operation_transaction(pool, crate::observability::WriterOperation::EventWrite)
