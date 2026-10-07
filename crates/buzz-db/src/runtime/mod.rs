@@ -1,8 +1,10 @@
+mod cold_start;
 mod connection_observability;
 pub mod migration;
 pub(crate) mod observability;
 pub mod replica_fence;
 
+pub use cold_start::ColdStartError;
 pub use connection_observability::{DbConnectionOutcome, DbConnectionStep};
 pub(crate) use connection_observability::{
     CONNECTION_DURATION_STEPS, CONNECTION_RAW_SERIES_PER_POD, CONNECTION_STARTED_STEPS,
